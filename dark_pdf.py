@@ -1,9 +1,9 @@
 """
-dark_pdf.py  ─  PDF 다크모드 변환기 (v3)
+dark_pdf.py  ─  PDF 다크모드 변환기 (v4)
 =========================================
 • 배경 → 검은색 (Black)
 • 텍스트 → 흰색 (White)  — 수식·특수 폰트 100% 보존
-• 래스터 이미지(피규어) → 흑백 픽셀 교환 (컬러 보존)
+• 래스터 이미지(피규어) → 사진은 그대로, 다이어그램만 흑백 교환
 • 벡터 선/도형 중 검은색 → 흰색 반전 (테이블 선 포함)
 • Form XObject 내부 벡터까지 재귀 처리
 
@@ -235,11 +235,66 @@ def swap_stream_colors(stream: bytes, prepend_white_default: bool = False) -> by
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  래스터 이미지(Image XObject) 흑백 픽셀 교환
-#  ─ 검은 픽셀 → 흰색, 흰색 픽셀 → 검은색, 컬러 유지
+#  래스터 이미지(Image XObject) 처리
+#  ─ 사진(photograph)은 자동 감지하여 건너뜀
+#  ─ 다이어그램/차트만 검은 픽셀 → 흰색, 흰색 픽셀 → 검은색
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 _IMG_BK = 40       # 0-255, 이 이하 → 근사 검정
 _IMG_WH = 215      # 0-255, 이 이상 → 근사 흰색
+
+# 사진 판별 임계값
+_PHOTO_MID_RATIO = 0.25   # 중간톤 픽셀이 25% 초과 → 사진
+_PHOTO_UNIQUE_COLORS = 80 # 양자화 후 유니크 색상 80개 초과 → 사진
+
+
+def _is_photograph(samples: bytes, w: int, h: int, n_ch: int) -> bool:
+    """이미지가 사진(photograph)인지 판별한다.
+
+    사진은 색상이 다양하고 중간톤 픽셀이 많다.
+    다이어그램/차트/표는 대부분 검정+흰색에 약간의 컬러.
+    사진이면 True → B/W 교환을 건너뛴다.
+    """
+    if _HAS_NUMPY:
+        arr = np.frombuffer(samples, dtype=np.uint8).reshape(h, w, n_ch)
+        rgb = arr[:, :, :3].reshape(-1, 3)
+        total = len(rgb)
+
+        r, g, b = rgb[:, 0], rgb[:, 1], rgb[:, 2]
+
+        # 근사 검정/흰색이 아닌 "중간톤" 픽셀 비율
+        near_bk = (r < _IMG_BK) & (g < _IMG_BK) & (b < _IMG_BK)
+        near_wh = (r > _IMG_WH) & (g > _IMG_WH) & (b > _IMG_WH)
+        mid_ratio = 1.0 - (np.sum(near_bk) + np.sum(near_wh)) / total
+
+        if mid_ratio > _PHOTO_MID_RATIO:
+            return True
+
+        # 색상 다양성 체크 (양자화 후 유니크 색상 수)
+        step = max(1, total // 10000)
+        sample = rgb[::step]
+        quantized = sample // 24          # ~10 levels per channel
+        unique = len(np.unique(quantized, axis=0))
+
+        if unique > _PHOTO_UNIQUE_COLORS:
+            return True
+
+        return False
+    else:
+        # numpy 없을 때: 중간톤 비율만 체크
+        total = w * h
+        mid = 0
+        step = max(1, total // 10000)
+        sampled_count = 0
+        for i in range(0, min(len(samples), total * n_ch), n_ch * step):
+            if i + 2 < len(samples):
+                r, g, b = samples[i], samples[i + 1], samples[i + 2]
+                if not (r < _IMG_BK and g < _IMG_BK and b < _IMG_BK) and \
+                   not (r > _IMG_WH and g > _IMG_WH and b > _IMG_WH):
+                    mid += 1
+                sampled_count += 1
+        if sampled_count > 0 and mid / sampled_count > _PHOTO_MID_RATIO:
+            return True
+        return False
 
 
 def _swap_bw_pixels_with_outline(samples: bytes, w: int, h: int, n_ch: int):
@@ -302,6 +357,7 @@ def _swap_bw_pixels_with_outline(samples: bytes, w: int, h: int, n_ch: int):
 
 def _process_raster_image(doc, xref):
     """Image XObject 의 흑백 픽셀을 교환한 Pixmap 을 반환한다.
+    사진(photograph)이면 "PHOTO" 문자열을 반환.
     수정이 불필요하거나 실패하면 None."""
     try:
         pix = fitz.Pixmap(doc, xref)
@@ -323,6 +379,10 @@ def _process_raster_image(doc, xref):
         except Exception:
             return None
 
+    # 사진(photograph) 감지 → 건너뜀
+    if _is_photograph(pix.samples, pix.width, pix.height, pix.n):
+        return "PHOTO"
+
     new_samples, modified = _swap_bw_pixels_with_outline(
         pix.samples, pix.width, pix.height, pix.n,
     )
@@ -338,7 +398,7 @@ def _process_raster_image(doc, xref):
 def convert_to_dark(input_path: str, output_path: str) -> None:
     doc = fitz.open(input_path)
 
-    # ── Phase 1: 래스터 이미지 흑백 픽셀 교환 ─────────────
+    # ── Phase 1: 래스터 이미지 처리 ──────────────────────
     processed_img = set()
     for page in doc:
         for img_info in page.get_images(full=True):
@@ -346,10 +406,12 @@ def convert_to_dark(input_path: str, output_path: str) -> None:
             if xref in processed_img:
                 continue
             processed_img.add(xref)
-            new_pix = _process_raster_image(doc, xref)
-            if new_pix:
+            result = _process_raster_image(doc, xref)
+            if result == "PHOTO":
+                print(f"    [PHOTO] xref={xref} photograph detected → skipped")
+            elif result is not None:
                 try:
-                    page.replace_image(xref, pixmap=new_pix)
+                    page.replace_image(xref, pixmap=result)
                 except Exception:
                     pass
                 print(f"    [IMG] xref={xref} image B/W swap done")
